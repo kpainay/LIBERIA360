@@ -19,7 +19,9 @@ window. Two options, both fine for this:
   values for section 1's two secrets (Blueprint auto-generates those) and
   section 3's domain/CORS wiring (Blueprint leaves those as placeholders you
   fill in once Render assigns your `*.onrender.com` URLs). See `render.yaml`'s
-  own comments for the exact steps.
+  own comments for the exact steps. The Blueprint also generates
+  `INTERNAL_PROXY_SECRET` on the API and shares it with the web service
+  (section 3's per-visitor rate limiting) — nothing to fill in.
 - **Railway**: no blueprint file — deploy from the dashboard as two services
   from this same repo (one for `api`, one for `web`) plus a Postgres
   database, wiring `DB_HOST`/`DB_PORT`/etc. to the database's variables. The
@@ -32,6 +34,9 @@ window. Two options, both fine for this:
   (`npm run start --workspace=web -- -p $PORT`), since it's the second app
   in this repo and root auto-detection can only point at one.
 
+  Also set the same `INTERNAL_PROXY_SECRET` on **both** services (see
+  "Rate limiting behind the web server" in section 3) — without it the
+  whole site shares one rate-limit budget.
   Railway bills for the memory each service actually uses, minute by
   minute, so how these two processes are started matters — see
   [Memory](#12-memory) below for the settings both start scripts apply and
@@ -85,6 +90,15 @@ node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"   # JWT
 node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # TWO_FACTOR_ENCRYPTION_KEY
 ```
 
+A third value, `INTERNAL_PROXY_SECRET`, must be set to the **same** string on
+the API and the web service — see "Rate limiting behind the web server" in
+section 3 for what it does. Not fatal if missing (the API logs a warning at
+boot instead), but don't launch without it:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # INTERNAL_PROXY_SECRET (both services)
+```
+
 You don't have to remember this: `validateProductionConfig` (`api/src/config/validate-production-config.ts`)
 runs at boot whenever `NODE_ENV=production` and **refuses to start** if
 either is still the committed dev placeholder — the two failure modes where
@@ -130,6 +144,64 @@ Existing Railway/Render web services that still define the former
 compatible. The web server uses it only when `API_ORIGIN` is absent and removes
 the legacy `/api/v1` suffix automatically. Set `API_ORIGIN` when convenient;
 if both variables exist, `API_ORIGIN` takes precedence.
+
+### Rate limiting behind the web server
+
+The API rate-limits per client address (`@nestjs/throttler`: 120
+requests/minute per endpoint by default, 5/minute on login, 2FA,
+password reset — see `api/src/auth/auth.controller.ts`). But browsers never
+call the API directly: their `/api/*` requests are reverse-proxied by the web
+server (`web/next.config.js` rewrites), and pages are rendered from
+server-side fetches made by the web server. Left alone, the API sees **the
+web server's address on every request** and the whole site shares one
+budget — a few dozen simultaneous visitors start getting HTTP 429s, and
+five bad logins from anyone lock everyone out of login for a minute.
+
+So the web server tells the API which visitor each request is for, and the
+API believes it only when the request also carries a secret the two services
+share:
+
+| Service | Variable | Value |
+|---|---|---|
+| `api` **and** `web` | `INTERNAL_PROXY_SECRET` | the same random string on both, at least 32 characters (section 1 has a generator). Server-only — never give it a `NEXT_PUBLIC_` name. |
+| `web` | `TRUST_PROXY_HOPS` | how many reverse proxies sit between the visitor and the **web** server. Defaults to `1` (one platform load balancer). |
+| `api` | `TRUST_PROXY_HOPS` | how many reverse proxies sit in front of the **API** itself. Only matters for clients that reach the API without going through the web server; defaults to `0`. |
+
+How it works, so the settings above make sense:
+
+- `web/src/proxy.ts` reads the visitor's address from `X-Forwarded-For` —
+  counting `TRUST_PROXY_HOPS` entries **from the right**, since only the
+  entries your own proxies appended can be trusted; anything further left is
+  whatever the client chose to send. It writes that address onto the request
+  as `X-Liberia360-Client-Ip` (overwriting any value the client sent), adds
+  `X-Liberia360-Proxy-Secret` on `/api/*` requests before they are rewritten
+  to the API, and `web/src/lib/visitor-headers.ts` adds the same pair to
+  server-side fetches.
+- The API (`api/src/common/client-ip.ts`) uses `X-Liberia360-Client-Ip` for
+  rate limiting, the login-activity log, the admin audit trail and
+  `ADMIN_LOGIN_IP_ALLOWLIST` **only** when the secret matches. Anyone
+  calling the API directly, without the secret, is attributed to the address
+  they connected from, exactly as before — the header alone is ignored, so it
+  can't be used to impersonate another visitor or to dodge the login limit.
+- If `INTERNAL_PROXY_SECRET` is missing on either side, nothing breaks: the
+  API falls back to the old shared-budget behaviour and warns about it at
+  boot.
+
+**Check `TRUST_PROXY_HOPS` on the web service after deploying.** Sign in,
+then look at Admin → Security → login activity: the address recorded for your
+login should be your own public IP. If it shows a load balancer / CDN
+address instead (the same one for every user), there is one more proxy in
+front of the web server than configured — raise `TRUST_PROXY_HOPS` on the
+web service by one and check again. Setting it too *high* is the unsafe
+direction: it makes the web server read an entry the client controls. Some
+platforms (Render among them, per its community forum) append to a
+client-supplied `X-Forwarded-For` rather than replacing it, which is exactly
+why the count is taken from the right.
+
+Keep the API reachable only through the web server where your platform
+allows it (a private/internal service). It isn't required — a direct caller
+can't forge a visitor address without the secret — but direct callers are
+all rate-limited as whatever address the API sees them connect from.
 
 ## 4. Object storage for uploaded photos
 
@@ -247,6 +319,9 @@ Takes effect on that user's very next request — no re-login needed (see
 
 ## 11. Known limitations, honestly listed
 
+- **Rate limiting is per visitor only when `INTERNAL_PROXY_SECRET` is set on
+  both services** (section 3). Without it every visitor shares the web
+  server's single budget.
 - **Rate limiting is per-instance, in-memory** (`@nestjs/throttler`'s
   default storage). Scale to N instances behind a load balancer and the
   *effective* limit on login/2FA/password-reset/uploads becomes roughly N×
