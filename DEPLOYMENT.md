@@ -37,6 +37,10 @@ window. Two options, both fine for this:
   Also set the same `INTERNAL_PROXY_SECRET` on **both** services (see
   "Rate limiting behind the web server" in section 3) — without it the
   whole site shares one rate-limit budget.
+  Railway bills for the memory each service actually uses, minute by
+  minute, so how these two processes are started matters — see
+  [Memory](#12-memory) below for the settings both start scripts apply and
+  the two optional Start Commands that trim a little more.
 
   Video thumbnail generation (`api/src/uploads/video-thumbnail.ts`) shells
   out to `ffmpeg`, which neither Railpack's auto-detected build nor Render's
@@ -354,6 +358,82 @@ Takes effect on that user's very next request — no re-login needed (see
   catalog's size this trades a bit of origin load for the public site never
   visibly disagreeing with an admin correction; revisit only if the catalog
   or traffic grows enough for that origin load to matter.
+
+## 12. Memory
+
+On usage-billed hosts (Railway) the bill is mostly resident memory × time,
+so the defaults below are chosen to keep both services' steady-state
+footprint down. Numbers are from running the production builds locally
+against Postgres with the same scripted traffic before and after.
+
+| | Before | After |
+|---|---|---|
+| `api` — peak while booting | 1,424 MB (29 s) | 140 MB (2 s) |
+| `api` — idle | 193 MB | 139 MB |
+| `api` — after ~500 catalog requests | 213 MB | 154 MB |
+| `api` — after 8 phone-photo uploads | 295 MB | 182 MB |
+| `web` — idle | 148 MB | 125 MB |
+| `web` — after ~190 page requests | 210–250 MB | 174 MB |
+
+What produces those numbers, and the knob for each:
+
+- **No TypeScript compile at boot.** The root `npm start` used to run
+  `migrate:api` first, which type-checks the whole API through `ts-node`
+  on every start — 1.4 GB and ~25 s even with nothing to migrate.
+  Migrations are applied by the API itself as it boots (`migrationsRun`
+  in `app.module.ts`, from the compiled `dist/database/migrations`), so
+  that step was pure overhead. `npm run migrate:api` still exists for
+  running them by hand.
+- **Heap ceilings** (`api/scripts/start-prod.sh`,
+  `web/scripts/start-prod.sh`). Node sizes its heap from the memory it is
+  allowed to use and is slow to collect below that, so both servers used
+  to hold 50–100 MB of already-dead objects after any burst of traffic.
+  Defaults: 256 MB old space, 8 MB semi-space, for each service. Override
+  with `API_MAX_OLD_SPACE_MB` / `WEB_MAX_OLD_SPACE_MB` (and
+  `*_MAX_SEMI_SPACE_MB`). The data each server really holds is 55–70 MB,
+  so 256 leaves about four times headroom; if either ever logs
+  `JavaScript heap out of memory`, raise its ceiling rather than removing
+  it.
+- **Allocator settings for the API** (`MALLOC_MMAP_THRESHOLD_`,
+  `MALLOC_TRIM_THRESHOLD_`, set in `api/scripts/start-prod.sh`). Without
+  them, memory used to decode an uploaded photo is kept by glibc instead
+  of being returned to the OS — one upload raised the process by ~100 MB
+  until the next restart.
+- **One photo processed at a time** (`uploads/image-processing.ts`), with
+  libvips' operation cache off and a 64-megapixel input limit. Trade-off:
+  four photos uploaded simultaneously now finish over ~3 s instead of ~1 s.
+- **Next.js** (`web/next.config.js`): `cacheMaxMemorySize: 0` (prerendered
+  pages are served from disk rather than also being held in a 50 MB
+  in-memory cache) and `experimental.preloadEntriesOnStart: false` (route
+  code is loaded on first use, not all ~150 routes at boot).
+- **Optional SDKs load only when configured**: Sentry without a
+  `SENTRY_DSN`, and the AWS SDK without `STORAGE_DRIVER=s3`, are no longer
+  loaded at all (about 6 MB each).
+
+Two things only the Railway dashboard can change:
+
+1. **Start Commands without `npm`.** Each `npm run ...` wrapper stays
+   alive beside the server for as long as it runs (~25–30 MB each). Set
+   each service's Custom Start Command (service Settings) to:
+   - `api`: `sh api/scripts/start-prod.sh`
+   - `web`: `sh web/scripts/start-prod.sh -p $PORT`
+2. **Resource limits.** Each service's settings let you cap its memory;
+   with the ceilings above, 512 MB per service is comfortable and
+   turns any future runaway into a visible restart instead of a larger
+   bill.
+
+Still open (not changed here, listed so they aren't a surprise):
+
+- **Video uploads are buffered whole, twice.** A 50 MB video is held in
+  memory by the web server (the `/api` rewrite buffers request bodies, see
+  `proxyClientMaxBodySize`) and again by the API (`multer` memory storage)
+  for the duration of the upload — roughly 110 MB per concurrent video.
+  With the allocator settings above it is released afterwards, but the
+  real fix is uploading straight to object storage with a presigned URL.
+- **Several list endpoints have no page size**, mostly admin queues and
+  per-owner lists (`admin.service.ts`, `admin-content.service.ts`,
+  message threads). They are small today and grow with the tables behind
+  them.
 
 ## CI
 
